@@ -1,0 +1,154 @@
+import { supabase } from "./supabaseClient";
+
+/** Fetch the shared daily task definitions (admin-managed, same for everyone). */
+export async function fetchDailyTaskDefs() {
+  const { data, error } = await supabase.from("daily_tasks").select("*").order("id");
+  if (error) throw error;
+  return data;
+}
+
+/** Fetch (or lazily create) today's task_progress rows for a user. */
+export async function fetchTodayTaskProgress(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await supabase
+    .from("task_progress")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("progress_date", today);
+  if (error) throw error;
+  return data;
+}
+
+/** Ensure a task_progress row exists for today, returns it. */
+async function ensureTaskProgressRow(userId, taskId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: existing, error: selErr } = await supabase
+    .from("task_progress")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("task_id", taskId)
+    .eq("progress_date", today)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  if (existing) return existing;
+
+  const { data: created, error: insErr } = await supabase
+    .from("task_progress")
+    .insert({ user_id: userId, task_id: taskId, progress_date: today, progress: 0, claimed: false })
+    .select()
+    .single();
+  if (insErr) throw insErr;
+  return created;
+}
+
+/**
+ * Increment progress on every task of a given type (e.g. 'win', 'play', 'moves')
+ * for today, capping at each task's target. Returns the updated rows.
+ */
+export async function incrementTaskProgress(userId, taskType, taskDefs, amount = 1) {
+  const matching = taskDefs.filter((t) => t.task_type === taskType);
+  const updated = [];
+  for (const def of matching) {
+    const row = await ensureTaskProgressRow(userId, def.id);
+    if (row.claimed) continue;
+    const newProgress = Math.min(def.target, row.progress + amount);
+    if (newProgress === row.progress) continue;
+    const { data, error } = await supabase
+      .from("task_progress")
+      .update({ progress: newProgress })
+      .eq("id", row.id)
+      .select()
+      .single();
+    if (error) throw error;
+    updated.push({ ...data, target: def.target, reward_points: def.reward_points, label: def.label });
+  }
+  return updated;
+}
+
+/** Claim a completed task's reward: marks claimed + credits points via RPC-free two-step update. */
+export async function claimTaskReward(userId, taskProgressRow, rewardPoints, currentPoints) {
+  const { data: claimedRow, error: claimErr } = await supabase
+    .from("task_progress")
+    .update({ claimed: true })
+    .eq("id", taskProgressRow.id)
+    .eq("claimed", false) // guard against double-claim race
+    .select()
+    .single();
+  if (claimErr) throw claimErr;
+
+  const { data: profile, error: profErr } = await supabase
+    .from("profiles")
+    .update({ points: currentPoints + rewardPoints })
+    .eq("id", userId)
+    .select()
+    .single();
+  if (profErr) throw profErr;
+
+  return { claimedRow, profile };
+}
+
+/** Log a completed game session (win/loss, moves, points earned). */
+export async function logGameSession(userId, { tierId, won, moves, pointsEarned, isTournament }) {
+  const { data, error } = await supabase
+    .from("game_sessions")
+    .insert({
+      user_id: userId,
+      tier_id: tierId,
+      won,
+      moves,
+      points_earned: pointsEarned,
+      is_tournament: isTournament,
+    })
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/** Fetch recent session history for a user. */
+export async function fetchSessionHistory(userId, limit = 20) {
+  const { data, error } = await supabase
+    .from("game_sessions")
+    .select("*")
+    .eq("user_id", userId)
+    .order("played_at", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data;
+}
+
+/** Adjust a player's points balance by a delta (positive or negative). Returns updated profile. */
+export async function adjustPoints(userId, currentPoints, delta) {
+  const newTotal = currentPoints + delta;
+  const { data, error } = await supabase
+    .from("profiles")
+    .update({ points: newTotal })
+    .eq("id", userId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/** Add to a player's cumulative play time in seconds. */
+export async function addPlaySeconds(userId, currentTotal, deltaSeconds) {
+  const { data, error } = await supabase
+    .from("profiles")
+    .update({ total_play_seconds: currentTotal + deltaSeconds })
+    .eq("id", userId)
+    .select()
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+/** Top players by points, for a simple leaderboard. */
+export async function fetchLeaderboard(limit = 10) {
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, display_name, points")
+    .order("points", { ascending: false })
+    .limit(limit);
+  if (error) throw error;
+  return data;
+}
